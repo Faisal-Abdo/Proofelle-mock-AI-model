@@ -1,0 +1,21 @@
+{
+  "Rolex": {
+    "Submariner": {
+      "collection": "Oyster Perpetual",
+      "material": "Stainless Steel",
+      "category": "Watch"
+    },
+    "Daytona": {
+      "collection": "Cosmograph",
+      "material": "Gold",
+      "category": "Watch"
+    }
+  },
+  "Louis Vuitton": {
+    "Neverfull MM": {
+      "collection": "Neverfull",
+      "material": "Monogram Canvas",
+      "category": "Bag"
+    }
+  }
+}
