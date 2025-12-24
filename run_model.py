@@ -1,115 +1,97 @@
 import json
-import torch
-import streamlit as st
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+import re
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-# ==================================================
-# Developer Configuration (CHANGE MODEL HERE ONLY)
-# ==================================================
-MODEL_NAME = "google/flan-t5-small"  # change freely: flan-t5-base, mistral-instruct, etc.
-REFERENCE_DATA_FILE = "brand-data.json"
-# ==================================================
+# ================= CONFIG =================
+MODEL_NAME = "google/flan-t5-small"  # change freely
+DB_FILE = "brand-data.json"
+# ========================================
 
+# Load model
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
-@st.cache_resource
-def load_model_and_tokenizer():
-    """
-    Loads any HuggingFace model safely.
-    Automatically detects seq2seq vs causal.
-    Cached to prevent Streamlit reloading crashes.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-    try:
-        model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
-        model_type = "seq2seq"
-    except Exception:
-        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
-        model_type = "causal"
-
-    # Safety fixes
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model.eval()
-    return tokenizer, model, model_type
+# Load canonical brand data
+with open(DB_FILE, "r") as f:
+    BRAND_DB = json.load(f)
 
 
-tokenizer, model, model_type = load_model_and_tokenizer()
+def extract_json(text):
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON found")
+    return json.loads(match.group())
 
-with open(REFERENCE_DATA_FILE, "r") as f:
-    reference_data = json.load(f)
 
+def validate_metadata(input_data):
+    warnings = []
+    suggested_fixes = {}
+    score = 1.0
 
-def validate_metadata(user_input: dict) -> dict:
-    """
-    AI-driven schema & logic validation.
-    Does NOT compare equality.
-    Uses reference data as contextual examples only.
-    """
+    brand = input_data.get("brand")
+    model_name = input_data.get("model_name")
 
-    prompt = f"""
-You are an AI validator for Proofelle, a luxury product digital authenticity platform.
-
-Reference examples of valid luxury product metadata:
-{json.dumps(reference_data, indent=2)}
-
-User-submitted product metadata:
-{json.dumps(user_input, indent=2)}
-
-Validation rules:
-1. Check completeness of fields.
-2. Detect logical inconsistencies (brand, price, retailer, date).
-3. Standardize values where possible.
-4. Assign a validation_score between 0 and 1.
-5. Return STRICT JSON ONLY with:
-   - validation_status (PASS / REVIEW / FAIL)
-   - validation_score
-   - warnings (array)
-   - suggested_fixes (object)
-"""
-
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        padding=True
-    )
-
-    with torch.no_grad():
-        if model_type == "seq2seq":
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=350
-            )
-        else:
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=350,
-                do_sample=True,
-                temperature=0.7,
-                pad_token_id=tokenizer.eos_token_id
-            )
-
-    raw_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-    # Robust JSON extraction
-    try:
-        start = raw_text.find("{")
-        end = raw_text.rfind("}") + 1
-        if start == -1 or end == -1:
-            raise ValueError("No JSON found")
-
-        json_block = raw_text[start:end]
-        return json.loads(json_block)
-
-    except Exception as e:
+    # ---------- Deterministic Validation ----------
+    if not brand or brand not in BRAND_DB:
         return {
-            "validation_status": "REVIEW",
-            "validation_score": 0.45,
-            "warnings": [
-                "AI output could not be parsed as strict JSON",
-                str(e)
-            ],
+            "validation_status": "FAIL",
+            "validation_score": 0.0,
+            "warnings": ["Unknown or missing brand"],
             "suggested_fixes": {}
         }
+
+    if not model_name or model_name not in BRAND_DB[brand]:
+        return {
+            "validation_status": "FAIL",
+            "validation_score": 0.0,
+            "warnings": ["Unknown or missing model for given brand"],
+            "suggested_fixes": {}
+        }
+
+    # Auto-fill canonical fields
+    canonical = BRAND_DB[brand][model_name]
+    suggested_fixes.update(canonical)
+
+    # ---------- AI Reasoning Layer ----------
+    prompt = f"""
+You MUST return ONLY valid JSON.
+No explanations. No markdown.
+
+Schema:
+{{
+  "warnings": [string],
+  "confidence_adjustment": number between -1 and 0
+}}
+
+Input:
+{json.dumps(input_data, indent=2)}
+
+Canonical truth:
+{json.dumps(canonical, indent=2)}
+
+Return JSON now.
+"""
+
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
+        outputs = model.generate(**inputs, max_new_tokens=200)
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        ai_json = extract_json(decoded)
+
+        warnings.extend(ai_json.get("warnings", []))
+        score += ai_json.get("confidence_adjustment", 0)
+
+    except Exception:
+        warnings.append("AI output could not be parsed as strict JSON")
+        score -= 0.3
+
+    score = max(0.0, min(1.0, round(score, 2)))
+
+    status = "PASS" if score >= 0.85 else "REVIEW" if score >= 0.4 else "FAIL"
+
+    return {
+        "validation_status": status,
+        "validation_score": score,
+        "warnings": warnings,
+        "suggested_fixes": suggested_fixes
+    }
